@@ -1,0 +1,334 @@
+import cmath
+from typing import Tuple, List, Optional
+import sympy
+import time
+
+class fluxo_potencia_newton_raphson_desacoplado():
+
+    def __init__(self, impedancia_linhas: list, barras: list, qnt_barras: int) -> None:
+
+        self.impedancia_linhas: list = impedancia_linhas
+        self.barras: list = barras
+        self.qnt_barras: int = qnt_barras
+        self.infinito: int = 1e300
+        self.indices_slack: list = [i for i, barra in enumerate(barras) if barra[1] == 'Vθ']
+        self.indices_pv: list = [i for i, barra in enumerate(barras) if barra[1] == 'PV']
+        
+        #self.solucao_newton_raphson_desacoplado(tolerancia=1e-4, num_maximo_iteracoes=20)
+            
+    def solucao_newton_raphson_desacoplado(self, tolerancia: int, num_maximo_iteracoes: int):
+        """
+        Soluciona o fluxo de potência utilizando o método de Newton-Raphson Desacoplado Rápido.
+        """
+
+        dados_execucao = {}
+        tempo_execucao_inicial = time.time()
+        
+        iteracao = 0
+        self.__calculo_matriz_admitancia__()
+        self.__configurar_condicoes_inicias__()
+        delta_p, p_c = self.__fluxo_de_potencia_p__()
+        delta_q, p_q = self.__fluxo_de_potencia_q__()
+        erro_p = self.__calculo_erro_p__(delta_p)
+        erro_q = self.__calculo_erro_p__(delta_p)
+
+        B_l1 = self.__matriz_B__()
+        B_l2 = self.__matriz_jacobiana_B__()
+    
+        #Acrescentar número infinito nos indices das barras Vθ em H
+        for i in self.indices_slack:
+            B_l1[i][i] = self.infinito
+            
+        #Acrescentar número infinito nos indices das barras Vθ e PV em L
+        for i in self.indices_slack + self.indices_pv:
+            B_l2[i][i] = self.infinito
+        
+        B_l1_inversa = self.__matriz_inversa_sympy__(B_l1)
+        B_l2_inversa = self.__matriz_inversa_sympy__(B_l2)
+
+        while (iteracao < num_maximo_iteracoes):
+            
+            #Meia Interação
+            delta_p, p_c = self.__fluxo_de_potencia_p__()
+            erro_p = self.__calculo_erro_p__(delta_p)
+           
+            if(erro_p < tolerancia and erro_q < tolerancia):
+                break
+
+            delta_p_linearizado = [
+                delta_p[i]/self.tensoes[i] 
+                for i in range(self.qnt_barras)
+            ]
+
+            vetor_correcao_angulos = self.__vetor_correcao__(B_l1_inversa, delta_p_linearizado)
+        
+            for i in range(self.qnt_barras):
+                self.angulos[i] += vetor_correcao_angulos[i]
+
+
+            #Meia Iteração
+            delta_q, q_c = self.__fluxo_de_potencia_q__()
+            erro_q = self.__calculo_erro_q__(delta_q)
+        
+            if(erro_p < tolerancia and erro_q < tolerancia):
+                break       
+
+            delta_q_linearizado = [
+                delta_q[i]/self.tensoes[i] 
+                for i in range(self.qnt_barras)
+            ]
+
+            vetor_correcao_tensoes = self.__vetor_correcao__(B_l2_inversa, delta_q_linearizado)
+            
+            for i in range(self.qnt_barras):
+                self.tensoes[i] += vetor_correcao_tensoes[i]
+
+            
+            dados_execucao[str(iteracao)] = { 
+                    "tensoes_iniciais": [self.tensoes[i] - vetor_correcao_tensoes[i] for i in range(self.qnt_barras)],
+                    "angulos_iniciais": [self.angulos[i] - vetor_correcao_angulos[i] for i in range(self.qnt_barras)],
+                    "p_calculado": p_c,
+                    "q_calculado": q_c,
+                    "delta_p": delta_p,
+                    "delta_q": delta_q,
+                    "jacobiana": [B_l1, B_l2],
+                    "jacobiana_inversa": [B_l1_inversa, B_l2_inversa],
+                    "vetor_correcao_angulos":  vetor_correcao_angulos,
+                    "vetor_correcao_tensoes":  vetor_correcao_tensoes,
+                    "tensoes_finais": self.tensoes,
+                    "angulos_finais": self.angulos
+            }
+        
+            iteracao += 1
+
+        tempo_execucao_final = time.time() - tempo_execucao_inicial 
+        dados_execucao['tempo_execucao'] = tempo_execucao_final
+        dados_execucao['matriz_admitancia'] = self.matriz_admitancia
+
+        if(iteracao > num_maximo_iteracoes):
+            dados_execucao['convergencia'] = False
+        else:
+            dados_execucao['convergencia'] = True
+            #Valores Finais
+            delta_q, q_c = self.__fluxo_de_potencia_q__()
+            delta_p, p_c = self.__fluxo_de_potencia_p__()
+
+            dados_execucao['solucao'] = {
+                'tensoes': self.tensoes,
+                'angulos': self.angulos,
+                'p': p_c,
+                'q': q_c,
+                'tempo': tempo_execucao_final,
+                'iteracoes': iteracao
+            }
+
+        return dados_execucao
+    
+    def __matriz_B__(self):
+        
+        # Inicializar a matriz B' com zeros
+        B = self.__inicializar_matriz__()
+        
+        # Preencher os elementos fora da diagonal e somar os inversos de x para os elementos da diagonal
+        for linha in self.impedancia_linhas:
+            de, para, r, x, b = linha
+            de_idx = de - 1
+            para_idx = para - 1
+            inv_x = 1 / x
+            
+            B[de_idx][para_idx] -= inv_x
+            B[para_idx][de_idx] -= inv_x
+            
+            B[de_idx][de_idx] += inv_x
+            B[para_idx][para_idx] += inv_x
+        
+        return B
+
+    def __vetor_correcao__(self, jacobiana: list, vector_mismatch: list) -> Tuple[List[float]]:
+        """
+        Multiplica a matriz Jacobiana pelo vetor de mismatches.
+        """
+        resultado = [0] * len(jacobiana)
+
+        for i in range(len(jacobiana)):
+            for j in range(len(vector_mismatch)):
+                resultado[i] += jacobiana[i][j] * vector_mismatch[j]
+        
+        return resultado
+
+    def __matriz_inversa_sympy__(self, matriz: list) -> Tuple[List[float]]:
+        """
+        Calcula a inversa de uma matriz usando SymPy.
+        """
+        matriz_sympy = sympy.Matrix(matriz)
+        matriz_sympy_invertida = matriz_sympy.inv()
+        
+        return matriz_sympy_invertida.tolist()
+                
+    def __calculo_matriz_admitancia__(self) -> None:
+        """
+        Calcula a matriz de admitância do sistema.
+        """
+
+        self.matriz_admitancia: list = [
+            [complex(0, 0)for _ in range(self.qnt_barras)] 
+            for _ in range(self.qnt_barras)
+        ]
+
+        for linha in self.impedancia_linhas:
+            barra_i, barra_j = linha[0] - 1, linha[1] - 1
+            y = 1/complex(linha[2], linha[3])
+            b_shunt = complex(0, linha[4] / 2)
+            self.matriz_admitancia[barra_i][barra_i] += y + b_shunt
+            self.matriz_admitancia[barra_j][barra_j] += y + b_shunt
+            self.matriz_admitancia[barra_i][barra_j] -= y
+            self.matriz_admitancia[barra_j][barra_i] -= y
+
+    def __configurar_condicoes_inicias__(self) -> None:
+        """
+        Configura as condições iniciais do sistema.
+        """
+
+        self.p_spec, self.q_spec, self.tensoes, self.angulos = [], [], [], []
+
+        for barra in self.barras:
+
+            self.tensoes.append(barra[2] if barra[2] != '-' else 1)
+            self.angulos.append(barra[3] if barra[3] != '-' else 0)
+
+            p_g = barra[4] if barra[4] != '-' else 0
+            q_g = barra[5] if barra[5] != '-' else 0
+            p_l = barra[6] if barra[6] != '-' else 0
+            q_l = barra[7] if barra[7] != '-' else 0
+
+            self.p_spec.append(p_g - p_l)
+            self.q_spec.append(q_g - q_l)
+
+    def __fluxo_de_potencia_p__(self) -> Tuple[List[float], List[float], List[float], List[float]]:
+        """
+        Calcula o fluxo de potência ativa no sistema.
+        """
+
+        V = [
+            cmath.rect(self.tensoes[i], self.angulos[i]) 
+            for i in range (self.qnt_barras)
+        ]
+
+        p_c = [0]*self.qnt_barras
+       
+        for k in range(self.qnt_barras):
+            for m in range(self.qnt_barras):
+                p_c[k] += (
+                    abs(V[k]) 
+                    * abs(V[m]) 
+                    * (self.matriz_admitancia[k][m].real 
+                    * cmath.cos(cmath.phase(V[k]) - cmath.phase(V[m])) 
+                    + self.matriz_admitancia[k][m].imag 
+                    * cmath.sin(cmath.phase(V[k]) - cmath.phase(V[m]))
+                    ).real
+                )
+               
+        delta_p = [
+            (self.p_spec[i] - p_c[i])/abs(V[k]) 
+            for i in range(self.qnt_barras)
+        ]
+     
+        return delta_p, p_c
+    
+    def __fluxo_de_potencia_q__(self) -> Tuple[List[float], List[float], List[float], List[float]]:
+        """
+        Calcula o fluxo de potência reativa no sistema.
+        """
+        V = [
+            cmath.rect(self.tensoes[i], self.angulos[i]) 
+            for i in range (self.qnt_barras)
+        ]
+
+        q_c = [0]*self.qnt_barras
+
+        for k in range(self.qnt_barras):
+            for m in range(self.qnt_barras):
+                q_c[k] += (
+                    abs(V[k]) 
+                    * abs(V[m]) 
+                    * (self.matriz_admitancia[k][m].real 
+                    * cmath.sin(cmath.phase(V[k]) - cmath.phase(V[m])) 
+                    - self.matriz_admitancia[k][m].imag 
+                    * cmath.cos(cmath.phase(V[k]) - cmath.phase(V[m]))
+                    ).real
+                )
+
+        delta_q = [
+            (self.q_spec[i] - q_c[i])/abs(V[k]) 
+            for i in range(self.qnt_barras)
+        ]
+
+        return delta_q, q_c
+
+    def __calculo_erro_p__(self, delta_p) -> Optional[float]:
+        """
+        Calcula o maior erro nos no vetor delta_P.
+        """
+        p_filtrada = []
+    
+        #Filtrar delta_p excluindo as barras de tipo "Vθ" 
+        for i, barra in enumerate(self.barras):
+            if barra[1] not in ["Vθ"]:
+                p_filtrada.append(abs(delta_p[i]))
+
+        # Calcular o valor absoluto máximo do vetor concatenado
+        if p_filtrada:
+            maior_erro = abs(p_filtrada[0])
+            for erro in p_filtrada[1:]:
+                erro_abs = abs(erro)
+                if erro_abs > maior_erro:
+                    maior_erro = erro_abs
+        else:
+            maior_erro = 0
+
+        return maior_erro
+
+    def __calculo_erro_q__(self, delta_q) -> Optional[float]:
+        """
+        Calcula o maior erro nos no vetor delta_Q.
+        """
+        q_filtrada = []
+    
+        # Filtrar delta_q excluindo as barras de tipo "Vθ" e "PV"
+        for i, barra in enumerate(self.barras):
+            if barra[1] not in ["Vθ", "PV"]:
+                q_filtrada.append(abs(delta_q[i]))
+
+        # Calcular o valor absoluto máximo do vetor concatenado
+        if q_filtrada:
+            maior_erro = abs(q_filtrada[0])
+            for erro in q_filtrada[1:]:
+                erro_abs = abs(erro)
+                if erro_abs > maior_erro:
+                    maior_erro = erro_abs
+        else:
+            maior_erro = 0
+
+        return maior_erro
+
+    def __inicializar_matriz__(self) -> List[int]:
+        "Criar matriz qnt_barras x qnt_barras"
+        return [
+            [0 for _ in range(self.qnt_barras)] 
+            for _ in range(self.qnt_barras)
+        ]
+
+
+    def __matriz_jacobiana_B__(self) -> Tuple[List[float]]:
+        """
+        Calcula a submatriz B, matriz Jacobiana.
+        """
+
+        B = self.__inicializar_matriz__()
+
+        for k in range(self.qnt_barras):
+            for m in range(self.qnt_barras):
+                B[k][m] =  (-self.matriz_admitancia[k][m].imag)
+
+        return B
+    
